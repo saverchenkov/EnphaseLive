@@ -67,8 +67,14 @@ class MainActivity : Activity() {
     private var activePeriod = "day" // "day" or "month"
     private var selectedDay = LocalDate.now(zone)
     private var selectedMonth = YearMonth.now(zone)
+    private var lastKnownToday = LocalDate.now(zone)
+    private var lastKnownMonth = YearMonth.now(zone)
     private var cloudLoading = false
+    private var lastCloudHistoryFetchMs = 0L
+    private var lastCloudHistoryFetchDay: LocalDate? = null
     private var lastChargerFetch = 0L
+    private var hasEvCharger: Boolean? = null
+    private var nextBackgroundCheck = 0L
     private var currentProfile = "Self-Consumption"
     private var nextTariffPoll = 0L
 
@@ -137,6 +143,10 @@ class MainActivity : Activity() {
         applyImmersiveMode()
         selectRealtimeDuration(3600L)
 
+        lastKnownToday = LocalDate.now(zone)
+        lastKnownMonth = YearMonth.now(zone)
+        selectedDay = lastKnownToday
+        selectedMonth = lastKnownMonth
         updateDateNavControls()
     }
 
@@ -248,6 +258,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 nextLocalPoll = 0L
                 nextTariffPoll = 0L
+                hasEvCharger = null
                 pollLocal()
                 requestCloudHistory(force = true)
                 requestEvCharger(force = true)
@@ -827,6 +838,81 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun checkDayRollover() {
+        val nowToday = LocalDate.now(zone)
+        val nowMonth = YearMonth.now(zone)
+
+        if (nowToday != lastKnownToday) {
+            val wasViewingToday = (activePeriod == "day" && selectedDay == lastKnownToday)
+            val wasViewingThisMonth = (activePeriod == "month" && selectedMonth == lastKnownMonth)
+
+            lastKnownToday = nowToday
+            lastKnownMonth = nowMonth
+
+            if (wasViewingToday) {
+                selectedDay = nowToday
+                historyChartView.clearSelection()
+                updateDateNavControls()
+                resetHistoryTotals()
+                val emptyBars = HistoryParser.day(nowToday.toString(), emptyMap())
+                val freshDay = JSONObject().put("period", "day").put("date", nowToday.toString()).put("bars", emptyBars)
+                historyChartView.update(freshDay)
+                historyChartView.message("Awaiting first readings for today")
+                historyFooterText.text = "Enphase cloud · New day · Refreshes at 6:30 AM"
+            } else if (wasViewingThisMonth && nowMonth != selectedMonth) {
+                selectedMonth = nowMonth
+                historyChartView.clearSelection()
+                updateDateNavControls()
+                resetHistoryTotals()
+                val emptyBars = HistoryParser.month(nowMonth.toString(), emptyMap())
+                val freshMonth = JSONObject().put("period", "month").put("date", nowMonth.toString()).put("bars", emptyBars)
+                historyChartView.update(freshMonth)
+                historyChartView.message("Awaiting first readings for this month")
+                historyFooterText.text = "Enphase cloud · New month · Refreshes at 6:30 AM"
+            } else {
+                updateDateNavControls()
+            }
+        }
+    }
+
+    private fun checkBackgroundRefresh() {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (nowElapsed < nextBackgroundCheck) return
+        nextBackgroundCheck = nowElapsed + 5000L
+
+        checkDayRollover()
+
+        if (!cloudClient.configured() || cloudLoading) return
+        if (cloudClient.callCount() >= 850) {
+            historyFooterText.text = "Enphase cloud · Budget cap reached (850/850)"
+            return
+        }
+
+        val nowToday = LocalDate.now(zone)
+        val nowMonth = YearMonth.now(zone)
+
+        val isViewingCurrent = if (activePeriod == "day") selectedDay == nowToday else selectedMonth == nowMonth
+        if (!isViewingCurrent) return
+
+        val nowLocalTime = java.time.LocalTime.now(zone)
+        val minuteOfDay = nowLocalTime.hour * 60 + nowLocalTime.minute
+
+        // Active daytime window: 6:30 AM to 10:30 PM (390 to 1350 minutes)
+        val inActiveWindow = minuteOfDay in 390..1350
+        if (!inActiveWindow) return
+
+        val refreshIntervalMs = 3 * 3600 * 1000L + 30 * 60 * 1000L // 3.5 hours
+        val isFirstMorningFetch = (lastCloudHistoryFetchDay != nowToday)
+        val intervalElapsed = (nowElapsed - lastCloudHistoryFetchMs >= refreshIntervalMs)
+
+        if (isFirstMorningFetch || intervalElapsed) {
+            requestCloudHistory(force = true)
+            if (hasEvCharger != false) {
+                requestEvCharger(force = false)
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Local Gateway Polling Loop (1 second cadence, independent of cloud)
     // -------------------------------------------------------------------------
@@ -970,6 +1056,7 @@ class MainActivity : Activity() {
         override fun run() {
             if (resumed) {
                 pollLocal()
+                checkBackgroundRefresh()
                 handler.postDelayed(this, 250L)
             }
         }
@@ -1000,6 +1087,16 @@ class MainActivity : Activity() {
                 val cacheNote = if (isPrior) "Cached permanently" else "Cached locally"
                 val calls = cloudClient.callCount()
                 historyFooterText.text = "Enphase cloud · $cacheNote · Calls: $calls / 850"
+                val fetchedAtSec = cached.optLong("_fetched_at", 0)
+                if (fetchedAtSec > 0) {
+                    val fetchedDate = Instant.ofEpochSecond(fetchedAtSec).atZone(zone).toLocalDate()
+                    if (fetchedDate == LocalDate.now(zone)) {
+                        lastCloudHistoryFetchDay = fetchedDate
+                        if (lastCloudHistoryFetchMs == 0L) {
+                            lastCloudHistoryFetchMs = SystemClock.elapsedRealtime()
+                        }
+                    }
+                }
                 return
             }
         }
@@ -1019,6 +1116,8 @@ class MainActivity : Activity() {
                 if (isDestroyed || !resumed) return@runOnUiThread
 
                 result.onSuccess { hist ->
+                    lastCloudHistoryFetchMs = SystemClock.elapsedRealtime()
+                    lastCloudHistoryFetchDay = LocalDate.now(zone)
                     historyChartView.update(hist)
                     updateHistoryTotals(hist)
                     val warning = hist.optString("warning")
@@ -1028,6 +1127,8 @@ class MainActivity : Activity() {
                     val cacheNote = if (isPrior) "Cached permanently" else "Cached"
                     historyFooterText.text = "Enphase cloud · $cacheNote · Calls: $calls / 850$warningSuffix"
                 }.onFailure { err ->
+                    // On failure, retry in 15 minutes instead of waiting full 3.5 hours
+                    lastCloudHistoryFetchMs = SystemClock.elapsedRealtime() - (3 * 3600 * 1000L + 15 * 60 * 1000L)
                     historyChartView.message(err.message ?: "History unavailable")
                     val calls = cloudClient.callCount()
                     historyFooterText.text = "History error: ${err.message} · Calls: $calls / 850"
@@ -1131,6 +1232,7 @@ class MainActivity : Activity() {
                     val devices = telemetry.optJSONObject("devices")
                     val evseList = devices?.optJSONArray("evse")
                     if (evseList != null && evseList.length() > 0) {
+                        hasEvCharger = true
                         val ev = evseList.getJSONObject(0)
                         val rawMode = if (ev.isNull("operational_mode")) "" else ev.optString("operational_mode", "")
                         val mode = if (rawMode.isEmpty() || rawMode.equals("null", true)) "Not Plugged-in" else rawMode.replace('_', ' ')
@@ -1139,6 +1241,7 @@ class MainActivity : Activity() {
 
                         energyFlowView.setEvCharger(powerKw, mode)
                     } else {
+                        hasEvCharger = false
                         energyFlowView.setEvCharger(null, "No charger")
                     }
                 }.onFailure {
@@ -1173,6 +1276,7 @@ class MainActivity : Activity() {
                     1 -> promptGatewayToken()
                     2 -> promptCloudConfig()
                     3 -> {
+                        hasEvCharger = null
                         requestCloudHistory(force = true)
                         requestEvCharger(force = true)
                         Toast.makeText(this, "Cloud refresh requested", Toast.LENGTH_SHORT).show()
@@ -1300,6 +1404,7 @@ class MainActivity : Activity() {
                 }
                 cloudClient.save(config)
                 Toast.makeText(this, "Cloud API configuration saved", Toast.LENGTH_SHORT).show()
+                hasEvCharger = null
                 requestCloudHistory(force = true)
                 requestEvCharger(force = true)
             }
@@ -1315,12 +1420,15 @@ class MainActivity : Activity() {
         super.onResume()
         resumed = true
         applyImmersiveMode()
+        checkDayRollover()
         handler.removeCallbacks(localTicker)
         handler.post(localTicker)
         val windowSamples = realtimeDataStore.getSamplesForWindow(activeRealtimeDuration)
         realtimeChartView.updateSamples(windowSamples)
         requestCloudHistory()
-        requestEvCharger()
+        if (hasEvCharger != false) {
+            requestEvCharger()
+        }
     }
 
     override fun onPause() {

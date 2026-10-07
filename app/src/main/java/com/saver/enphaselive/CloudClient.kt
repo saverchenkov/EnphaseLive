@@ -88,7 +88,7 @@ class CloudClient(private val context: Context) {
             return config.getString("access_token")
         } finally { connection.disconnect() }
     }
-    private fun request(path: String, params: Map<String, String>, maxAge: Long): JSONObject {
+    private fun request(path: String, params: Map<String, String>, maxAge: Long, force: Boolean = false): JSONObject {
         val config = credentials.read() ?: error("Connect Enphase history in Settings")
         val key = config.optString("api_key")
         require(key.isNotBlank()) { "History requires an API v4 application key" }
@@ -96,7 +96,7 @@ class CloudClient(private val context: Context) {
         val id = MessageDigest.getInstance("SHA-256").digest((path+query+key).toByteArray()).joinToString("") { "%02x".format(it) }
         val directory = File(context.noBackupFilesDir, "cloud_cache").apply { mkdirs() }
         val cache = File(directory, "$id.json")
-        if (cache.exists() && System.currentTimeMillis()-cache.lastModified() < maxAge) {
+        if (!force && cache.exists() && System.currentTimeMillis()-cache.lastModified() < maxAge) {
             val cached = JSONObject(cache.readText())
             if (cached.has("_error")) throw IllegalStateException(cached.getString("_error"))
             return cached
@@ -152,26 +152,46 @@ class CloudClient(private val context: Context) {
     private val memoryHistoryCache = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
     private val parsedCacheDir = File(context.noBackupFilesDir, "parsed_history").apply { mkdirs() }
 
-    fun isPriorPeriod(period: String, date: String): Boolean {
-        return try {
-            val today = LocalDate.now(zone)
-            if (period == "month") {
-                YearMonth.parse(date) < YearMonth.from(today)
-            } else {
-                LocalDate.parse(date) < today
-            }
-        } catch (_: Exception) { false }
-    }
+    fun isPriorPeriod(period: String, date: String): Boolean = Companion.isPriorPeriod(period, date, LocalDate.now(zone))
+
+    /**
+     * Determines whether a cached period was fetched after the period ended.
+     * Prevents partial mid-day or mid-month snapshots from being permanently cached forever.
+     */
+    fun isPeriodComplete(period: String, date: String, timestampMs: Long): Boolean = Companion.isPeriodComplete(period, date, timestampMs, zone)
 
     fun getCachedHistory(period: String, date: String): JSONObject? {
         val key = "${period}_$date"
-        memoryHistoryCache[key]?.let { return it }
+        val isPrior = isPriorPeriod(period, date)
+
+        memoryHistoryCache[key]?.let { cached ->
+            val fetchedAt = cached.optLong("_fetched_at", 0) * 1000L
+            val complete = isPrior && isPeriodComplete(period, date, fetchedAt)
+            if (isPrior && !complete) {
+                // Incomplete prior period cached mid-day: invalidate so we fetch full completed period
+                memoryHistoryCache.remove(key)
+            } else if (complete || (!isPrior && System.currentTimeMillis() - fetchedAt < 2 * 60 * 60 * 1000L + 30 * 60 * 1000L)) {
+                return cached
+            }
+        }
 
         val file = File(parsedCacheDir, "$key.json")
         if (file.exists()) {
-            val isPrior = isPriorPeriod(period, date)
-            val maxAge = if (isPrior) Long.MAX_VALUE else 4 * 60 * 60 * 1000L
-            if (isPrior || (System.currentTimeMillis() - file.lastModified() < maxAge)) {
+            val complete = isPrior && isPeriodComplete(period, date, file.lastModified())
+            if (complete) {
+                return runCatching {
+                    val obj = JSONObject(file.readText())
+                    memoryHistoryCache[key] = obj
+                    obj
+                }.getOrNull()
+            }
+            if (isPrior) {
+                // Prior period file exists but was fetched mid-day before the period completed.
+                // Invalidate so we fetch the complete 24 hours now that the period is finished!
+                return null
+            }
+            val maxAge = 2 * 60 * 60 * 1000L + 30 * 60 * 1000L // 2.5 hours for current day
+            if (System.currentTimeMillis() - file.lastModified() < maxAge) {
                 return runCatching {
                     val obj = JSONObject(file.readText())
                     memoryHistoryCache[key] = obj
@@ -193,6 +213,7 @@ class CloudClient(private val context: Context) {
     }
 
     fun history(period: String, date: String, force: Boolean = false): JSONObject {
+        val isPrior = isPriorPeriod(period, date)
         if (!force) {
             getCachedHistory(period, date)?.let { return it }
         }
@@ -206,12 +227,14 @@ class CloudClient(private val context: Context) {
         val today = LocalDate.now(zone)
         val selected = if (period == "month") YearMonth.parse(date).atDay(1) else LocalDate.parse(date)
         val current = if (period == "month") YearMonth.from(today) == YearMonth.from(selected) else selected == today
-        val ttl = if (current) 4*60*60*1000L else 365*24*60*60*1000L
+        val ttl = if (current) 2 * 60 * 60 * 1000L + 30 * 60 * 1000L else 365 * 24 * 60 * 60 * 1000L
         val params = if (period == "month") mapOf("start_date" to selected.toString(), "end_date" to minOf(YearMonth.from(selected).atEndOfMonth(), today).toString())
             else mapOf("start_at" to selected.atStartOfDay(zone).toEpochSecond().toString(), "granularity" to "day")
+
+        val shouldForce = force || isPrior
         for ((metric, path) in endpoints) {
             try {
-                val response = request(path, params, ttl)
+                val response = request(path, params, ttl, force = shouldForce)
                 responses[metric] = response
                 if (response.has("_cache_warning")) warnings.add(response.getString("_cache_warning"))
                 if (metric == "charge") responses["discharge"] = response
@@ -221,14 +244,40 @@ class CloudClient(private val context: Context) {
             }
         }
         val bars = if (period == "month") HistoryParser.month(date, responses) else HistoryParser.day(date, responses)
-        val isPrior = isPriorPeriod(period, date)
+        val nowMs = System.currentTimeMillis()
+        val isComplete = isPrior && isPeriodComplete(period, date, nowMs)
         val result = JSONObject().put("period", period).put("date", date).put("bars", bars)
-            .put("source", if (isPrior) "Enphase cloud · cached permanently" else "Enphase cloud · cached up to 4h")
-            .put("updated_at", responses.values.minOfOrNull { it.optLong("_fetched_at", 0) } ?: (System.currentTimeMillis() / 1000))
+            .put("source", if (isComplete) "Enphase cloud · cached permanently" else "Enphase cloud · cached")
+            .put("_fetched_at", nowMs / 1000)
+            .put("updated_at", responses.values.minOfOrNull { it.optLong("_fetched_at", 0) } ?: (nowMs / 1000))
             .put("warning", warnings.distinct().joinToString(" · "))
         saveCachedHistory(period, date, result)
         return result
     }
-    fun charger(): JSONObject = request("latest_telemetry", emptyMap(), 3*60*60*1000L)
+    fun charger(): JSONObject = request("latest_telemetry", emptyMap(), 30 * 60 * 1000L)
     fun callCount(): Int = if (usage.getString("month", "") == YearMonth.now(zone).toString()) usage.getInt("count", 0) else 0
+
+    companion object {
+        fun isPriorPeriod(period: String, date: String, today: LocalDate = LocalDate.now()): Boolean {
+            return try {
+                if (period == "month") {
+                    YearMonth.parse(date) < YearMonth.from(today)
+                } else {
+                    LocalDate.parse(date) < today
+                }
+            } catch (_: Exception) { false }
+        }
+
+        fun isPeriodComplete(period: String, date: String, timestampMs: Long, zone: ZoneId = ZoneId.systemDefault()): Boolean {
+            return try {
+                if (period == "month") {
+                    val endOfMonthMs = YearMonth.parse(date).plusMonths(1).atDay(1).atStartOfDay(zone).toEpochSecond() * 1000L
+                    timestampMs >= endOfMonthMs
+                } else {
+                    val endOfDayMs = LocalDate.parse(date).plusDays(1).atStartOfDay(zone).toEpochSecond() * 1000L
+                    timestampMs >= endOfDayMs
+                }
+            } catch (_: Exception) { false }
+        }
+    }
 }
