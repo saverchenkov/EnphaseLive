@@ -67,40 +67,23 @@ class EnergyFlowView(context: Context) : View(context) {
     }
 
     /**
-     * Maps battery charge percentage (0-100) to a continuous color transition
-     * from warning Red (low), to Amber/Yellow (medium), to Emerald Green (high).
+     * Maps battery charge percentage (0-100) to status colors:
+     * - Below 10%: Red
+     * - Below 20%: Orange
+     * - Below 30%: Yellow
+     * - 30% and above: Green
      */
-    private fun getBatteryColor(soc: Int): Int {
-        if (soc < 0) return green
-        val clamped = soc.coerceIn(0, 100)
-        return when {
-            clamped <= 20 -> {
-                // Low (< 20%): Warning Red
-                Color.rgb(240, 68, 68) // #F04444
-            }
-            clamped <= 50 -> {
-                // 20% to 50%: Red -> Yellow
-                val t = (clamped - 20) / 30f
-                val r = (240 + (250 - 240) * t).toInt()
-                val g = (68 + (205 - 68) * t).toInt()
-                val b = (68 + (45 - 68) * t).toInt()
-                Color.rgb(r, g, b)
-            }
-            clamped <= 80 -> {
-                // 50% to 80%: Yellow -> Lime/Green
-                val t = (clamped - 50) / 30f
-                val r = (250 + (100 - 250) * t).toInt()
-                val g = (205 + (225 - 205) * t).toInt()
-                val b = (45 + (120 - 45) * t).toInt()
-                Color.rgb(r, g, b)
-            }
-            else -> {
-                // 80% to 100%: Emerald Green
-                val t = (clamped - 80) / 20f
-                val r = (100 + (82 - 100) * t).toInt()
-                val g = (225 + (229 - 225) * t).toInt()
-                val b = (120 + (140 - 120) * t).toInt()
-                Color.rgb(r, g, b)
+    private fun getBatteryColor(soc: Int): Int = Companion.getBatteryColor(soc)
+
+    companion object {
+        fun getBatteryColor(soc: Int): Int {
+            if (soc < 0) return Color.rgb(82, 229, 140)
+            val clamped = soc.coerceIn(0, 100)
+            return when {
+                clamped < 10 -> Color.rgb(240, 68, 68)   // Red (< 10%)
+                clamped < 20 -> Color.rgb(255, 140, 40)  // Orange (< 20%)
+                clamped < 30 -> Color.rgb(250, 205, 45)  // Yellow (< 30%)
+                else -> Color.rgb(82, 229, 140)          // Green (>= 30%)
             }
         }
     }
