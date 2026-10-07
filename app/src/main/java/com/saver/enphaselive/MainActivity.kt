@@ -2,9 +2,11 @@ package com.saver.enphaselive
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
@@ -13,6 +15,7 @@ import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.view.WindowManager
 import android.widget.*
 import org.json.JSONObject
@@ -85,7 +88,11 @@ class MainActivity : Activity() {
     // Live panel views
     private lateinit var gridBadge: TextView
     private lateinit var profileBadge: TextView
+    private lateinit var stormBadge: TextView
     private lateinit var liveStatusText: TextView
+    private var stormAlertActive = false
+    private var stormAlertDetails = ""
+    private var stormAlertUntil: String? = null
 
     // History panel views
     private lateinit var btnDay: TextView
@@ -226,6 +233,10 @@ class MainActivity : Activity() {
             setPadding(dp(12f), dp(4f), dp(12f), dp(4f))
             gravity = Gravity.CENTER
             typeface = Typeface.DEFAULT_BOLD
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Grid status: On Grid. Tap for grid options."
+            setOnClickListener { showGridControlDialog() }
         }
         header.addView(gridBadge)
 
@@ -237,11 +248,34 @@ class MainActivity : Activity() {
             setPadding(dp(12f), dp(4f), dp(12f), dp(4f))
             gravity = Gravity.CENTER
             typeface = Typeface.DEFAULT_BOLD
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Battery profile: Self-Consumption. Tap to change."
+            setOnClickListener { showProfileSwitchDialog() }
         }
         val profileParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             leftMargin = dp(8f)
         }
         header.addView(profileBadge, profileParams)
+
+        stormBadge = TextView(this).apply {
+            text = "⚡ Storm Alert"
+            textSize = 12f
+            setTextColor(Color.rgb(255, 220, 100))
+            background = cardBackground(Color.rgb(65, 38, 10), Color.rgb(245, 160, 35), 14f)
+            setPadding(dp(12f), dp(4f), dp(12f), dp(4f))
+            gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            visibility = View.GONE
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Storm Alert active. Tap to view details and opt out."
+            setOnClickListener { showStormAlertDialog() }
+        }
+        val stormParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(8f)
+        }
+        header.addView(stormBadge, stormParams)
 
         val spacer = View(this)
         header.addView(spacer, LinearLayout.LayoutParams(0, 1, 1f))
@@ -949,8 +983,27 @@ class MainActivity : Activity() {
                             }
                         } else currentProfile
                     }
+                    val scheduleObj = json.optJSONObject("schedule")
+                    val isStorm = (override && mode.contains("backup", true)) ||
+                        json.optBoolean("storm_guard", false) ||
+                        scheduleObj?.optBoolean("storm_guard", false) == true ||
+                        json.optJSONObject("tariff")?.optJSONObject("storage_settings")?.optBoolean("storm_guard", false) == true
+
+                    val endEpoch = scheduleObj?.optLong("end_time", 0L).let { if (it != null && it > 0) it else scheduleObj?.optLong("override_end_time", 0L) } ?: 0L
+                    val untilText = if (endEpoch > 0) {
+                        val zdt = Instant.ofEpochSecond(endEpoch).atZone(zone)
+                        if (zdt.toLocalDate() == LocalDate.now(zone)) {
+                            "Until " + zdt.format(DateTimeFormatter.ofPattern("h:mm a"))
+                        } else {
+                            "Until " + zdt.format(DateTimeFormatter.ofPattern("MMM d, h:mm a"))
+                        }
+                    } else null
+
                     runOnUiThread {
-                        if (!isDestroyed && resumed) updateProfileBadge(resolved)
+                        if (!isDestroyed && resumed) {
+                            updateProfileBadge(resolved)
+                            updateStormBadge(isStorm, untilText, "Storm Guard has switched your system to Full Backup to reserve 100% battery capacity for severe weather.")
+                        }
                     }
                 }.onFailure {
                     nextTariffPoll = nowMs + 15000L
@@ -1049,6 +1102,19 @@ class MainActivity : Activity() {
                 profileBadge.setTextColor(Color.rgb(86, 216, 238))
                 profileBadge.background = pillBackground(Color.rgb(18, 44, 58))
             }
+        }
+    }
+
+    private fun updateStormBadge(active: Boolean, untilStr: String?, details: String = "") {
+        stormAlertActive = active
+        stormAlertUntil = untilStr
+        stormAlertDetails = details
+
+        if (active) {
+            stormBadge.text = if (!untilStr.isNullOrEmpty()) "⚡ Storm Alert · $untilStr" else "⚡ Storm Alert Active"
+            stormBadge.visibility = View.VISIBLE
+        } else {
+            stormBadge.visibility = View.GONE
         }
     }
 
@@ -1252,6 +1318,403 @@ class MainActivity : Activity() {
     }
 
     // -------------------------------------------------------------------------
+    // Profile, Grid & Storm Dialogs
+    // -------------------------------------------------------------------------
+
+    private fun showProfileSwitchDialog() {
+        data class ProfileOption(
+            val key: String,
+            val label: String,
+            val icon: String,
+            val desc: String
+        )
+
+        val options = listOf(
+            ProfileOption(
+                key = "self-consumption",
+                label = "Self-Consumption",
+                icon = "☀️",
+                desc = "Maximize solar self-use. The battery powers your home in the evening to minimize importing energy from the grid."
+            ),
+            ProfileOption(
+                key = "savings",
+                label = "Savings (Time-of-Use)",
+                icon = "⚡",
+                desc = "Optimize electricity costs. The battery charges during low-rate hours and discharges during expensive peak tariff hours."
+            ),
+            ProfileOption(
+                key = "backup",
+                label = "Full Backup",
+                icon = "🛡️",
+                desc = "Maintains 100% battery reserve capacity at all times to ensure maximum resilience against power outages."
+            )
+        )
+
+        val currentIdx = when {
+            currentProfile.contains("Savings", ignoreCase = true) -> 1
+            currentProfile.contains("Backup", ignoreCase = true) -> 2
+            else -> 0
+        }
+        var selectedIdx = currentIdx
+
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBackground(Color.rgb(15, 23, 33), Color.rgb(38, 55, 75), 16f)
+            setPadding(dp(22f), dp(20f), dp(22f), dp(20f))
+        }
+
+        val titleView = TextView(this).apply {
+            text = "Battery Operating Profile"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(240, 246, 252))
+        }
+        container.addView(titleView)
+
+        val subView = TextView(this).apply {
+            text = "Select how your battery stores and distributes solar power"
+            textSize = 12f
+            setTextColor(Color.rgb(139, 148, 158))
+        }
+        val subParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(4f)
+            bottomMargin = dp(16f)
+        }
+        container.addView(subView, subParams)
+
+        val cardViews = mutableListOf<LinearLayout>()
+        val indicatorViews = mutableListOf<TextView>()
+
+        fun refreshCardSelection() {
+            cardViews.forEachIndexed { i, card ->
+                val isSel = i == selectedIdx
+                if (isSel) {
+                    card.background = cardBackground(Color.rgb(18, 44, 62), Color.rgb(56, 189, 248), 12f)
+                    indicatorViews[i].text = "●"
+                    indicatorViews[i].setTextColor(Color.rgb(56, 189, 248))
+                } else {
+                    card.background = cardBackground(Color.rgb(20, 30, 42), Color.rgb(35, 50, 68), 12f)
+                    indicatorViews[i].text = "○"
+                    indicatorViews[i].setTextColor(Color.rgb(75, 95, 115))
+                }
+            }
+        }
+
+        options.forEachIndexed { index, opt ->
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14f), dp(12f), dp(14f), dp(12f))
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    selectedIdx = index
+                    refreshCardSelection()
+                }
+            }
+
+            val iconView = TextView(this).apply {
+                text = opt.icon
+                textSize = 20f
+                gravity = Gravity.CENTER
+            }
+            card.addView(iconView, LinearLayout.LayoutParams(dp(32f), dp(32f)))
+
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            val nameView = TextView(this).apply {
+                text = opt.label
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(235, 245, 255))
+            }
+            textCol.addView(nameView)
+
+            val descView = TextView(this).apply {
+                text = opt.desc
+                textSize = 11.5f
+                setTextColor(Color.rgb(148, 163, 184))
+                setLineSpacing(dp(2f).toFloat(), 1.05f)
+            }
+            val descParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(2f)
+            }
+            textCol.addView(descView, descParams)
+
+            val textColParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = dp(12f)
+                rightMargin = dp(12f)
+            }
+            card.addView(textCol, textColParams)
+
+            val indicator = TextView(this).apply {
+                textSize = 18f
+                gravity = Gravity.CENTER
+            }
+            card.addView(indicator, LinearLayout.LayoutParams(dp(28f), dp(28f)))
+
+            cardViews.add(card)
+            indicatorViews.add(indicator)
+
+            val cardParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(10f)
+            }
+            container.addView(card, cardParams)
+        }
+
+        refreshCardSelection()
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        }
+        val btnRowParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(6f)
+        }
+
+        val btnCancel = TextView(this).apply {
+            text = "Cancel"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(148, 163, 184))
+            background = cardBackground(Color.rgb(24, 36, 48), Color.rgb(42, 60, 80), 8f)
+            setPadding(dp(18f), dp(10f), dp(18f), dp(10f))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { dialog.dismiss() }
+        }
+        btnRow.addView(btnCancel)
+
+        val btnApply = TextView(this).apply {
+            text = "Apply Profile"
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(10, 22, 32))
+            background = cardBackground(Color.rgb(56, 189, 248), Color.rgb(56, 189, 248), 8f)
+            setPadding(dp(22f), dp(10f), dp(22f), dp(10f))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                dialog.dismiss()
+                val targetMode = options[selectedIdx].key
+                val targetLabel = options[selectedIdx].label
+                updateProfileBadge(targetLabel)
+                Toast.makeText(this@MainActivity, "Applying $targetLabel profile...", Toast.LENGTH_SHORT).show()
+
+                localWorker.execute {
+                    val result = runCatching {
+                        val payload = JSONObject().apply {
+                            put("tariff", JSONObject().apply {
+                                put("storage_settings", JSONObject().apply {
+                                    put("mode", targetMode)
+                                })
+                            })
+                            put("schedule", JSONObject().apply {
+                                put("battery_mode", targetMode)
+                            })
+                        }
+                        gatewayClient.readRaw("/admin/lib/tariff", payload.toString())
+                    }
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        result.onSuccess {
+                            Toast.makeText(this@MainActivity, "Battery profile set to $targetLabel", Toast.LENGTH_SHORT).show()
+                            nextTariffPoll = 0L
+                            pollLocal()
+                        }.onFailure { err ->
+                            val msg = err.message ?: "Gateway rejected local profile update"
+                            showDarkNoticeDialog(
+                                title = "Profile Update Notice",
+                                message = "Profile command sent, but gateway reported:\n$msg\n\nNote: If your system uses Enphase Cloud-Sourced Schedules, profile changes must be confirmed via the official Enphase App (Menu → Settings → Profile)."
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        val applyParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(12f)
+        }
+        btnRow.addView(btnApply, applyParams)
+
+        container.addView(btnRow, btnRowParams)
+
+        dialog.setContentView(container)
+        dialog.window?.let { win ->
+            win.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            val widthPx = (520 * resources.displayMetrics.density).toInt().coerceAtMost(resources.displayMetrics.widthPixels - dp(32f))
+            win.setLayout(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dialog.show()
+    }
+
+    private fun showDarkNoticeDialog(
+        title: String,
+        message: String,
+        positiveText: String = "Close",
+        onPositive: (() -> Unit)? = null,
+        negativeText: String? = null,
+        onNegative: (() -> Unit)? = null
+    ) {
+        val dialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBackground(Color.rgb(15, 23, 33), Color.rgb(38, 55, 75), 16f)
+            setPadding(dp(22f), dp(20f), dp(22f), dp(20f))
+        }
+
+        val titleView = TextView(this).apply {
+            text = title
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(240, 246, 252))
+        }
+        container.addView(titleView)
+
+        val msgView = TextView(this).apply {
+            text = message
+            textSize = 12.5f
+            setTextColor(Color.rgb(180, 200, 215))
+            setLineSpacing(dp(3f).toFloat(), 1.05f)
+        }
+        val msgParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(12f)
+            bottomMargin = dp(18f)
+        }
+        container.addView(msgView, msgParams)
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        }
+
+        if (!negativeText.isNullOrEmpty()) {
+            val btnNeg = TextView(this).apply {
+                text = negativeText
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(148, 163, 184))
+                background = cardBackground(Color.rgb(24, 36, 48), Color.rgb(42, 60, 80), 8f)
+                setPadding(dp(16f), dp(8f), dp(16f), dp(8f))
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    dialog.dismiss()
+                    onNegative?.invoke()
+                }
+            }
+            btnRow.addView(btnNeg)
+        }
+
+        val btnPos = TextView(this).apply {
+            text = positiveText
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(10, 22, 32))
+            background = cardBackground(Color.rgb(56, 189, 248), Color.rgb(56, 189, 248), 8f)
+            setPadding(dp(20f), dp(8f), dp(20f), dp(8f))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                dialog.dismiss()
+                onPositive?.invoke()
+            }
+        }
+        val posParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            if (!negativeText.isNullOrEmpty()) leftMargin = dp(10f)
+        }
+        btnRow.addView(btnPos, posParams)
+
+        container.addView(btnRow)
+
+        dialog.setContentView(container)
+        dialog.window?.let { win ->
+            win.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            val widthPx = (480 * resources.displayMetrics.density).toInt().coerceAtMost(resources.displayMetrics.widthPixels - dp(32f))
+            win.setLayout(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dialog.show()
+    }
+
+    private fun showGridControlDialog() {
+        val isOnGrid = gridBadge.text.toString().contains("On Grid", ignoreCase = true)
+        val title = if (isOnGrid) "Utility Grid Connected" else "Off-Grid Islanded Microgrid"
+        val statusDesc = if (isOnGrid) {
+            "Status: Normal Grid Connection\n\n" +
+            "Your home's IQ System Controller (Enpower) microgrid intertie relay is CLOSED. Solar, battery, and home loads are synchronized with the utility grid."
+        } else {
+            "Status: Operating Off-Grid\n\n" +
+            "Your home's IQ System Controller microgrid intertie relay is OPEN. Your home is operating as an independent islanded microgrid powered by solar and storage."
+        }
+
+        val safetyNote = if (isOnGrid) {
+            "\n\n⚡ Going Off-Grid:\n" +
+            "Transitioning to off-grid requires mechanically opening the 200A microgrid intertie relay. For physical safety and electrical code compliance (NEC 705/710), Enphase requires this action to be authenticated via the official Enphase App (Menu → Settings → Advanced → Off-Grid) using two-factor authorization."
+        } else {
+            "\n\n⚡ Reconnecting to Grid:\n" +
+            "The system will automatically re-synchronize and close the relay when stable utility grid voltage and frequency are detected for 5 minutes, or you can command a reconnect via the Enphase App."
+        }
+
+        showDarkNoticeDialog(title, statusDesc + safetyNote)
+    }
+
+    private fun showStormAlertDialog() {
+        val untilMsg = if (!stormAlertUntil.isNullOrEmpty()) "\nScheduled duration: $stormAlertUntil\n" else ""
+        val message = "⛈️ Active Storm Alert\n\n" +
+            "Enphase Storm Guard has detected severe weather warnings in your area. To ensure maximum resilience against potential utility outages, your battery has been automatically placed into Full Backup mode to charge to 100% capacity." +
+            "$untilMsg\n" +
+            "Would you like to opt out and return your battery to normal operating mode?"
+
+        showDarkNoticeDialog(
+            title = "Storm Guard Alert",
+            message = message,
+            positiveText = "Opt Out of Storm Alert",
+            onPositive = {
+                Toast.makeText(this, "Sending opt-out request...", Toast.LENGTH_SHORT).show()
+                localWorker.execute {
+                    val result = runCatching {
+                        val payload = JSONObject().apply {
+                            put("schedule", JSONObject().apply {
+                                put("override", false)
+                            })
+                            put("tariff", JSONObject().apply {
+                                put("storage_settings", JSONObject().apply {
+                                    put("mode", "self-consumption")
+                                })
+                            })
+                        }
+                        gatewayClient.readRaw("/admin/lib/tariff", payload.toString())
+                    }
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        result.onSuccess {
+                            updateStormBadge(false, null)
+                            updateProfileBadge("Self-Consumption")
+                            Toast.makeText(this@MainActivity, "Opt-out sent. Battery returning to Self-Consumption.", Toast.LENGTH_LONG).show()
+                            nextTariffPoll = 0L
+                            pollLocal()
+                        }.onFailure { err ->
+                            showDarkNoticeDialog(
+                                title = "Opt-Out Information",
+                                message = "To opt out of this specific storm alert, open the official Enphase App where the active Storm banner has an immediate 1-tap 'Opt Out' button, or disable Storm Guard under Menu → Settings → Profile → Storm Guard."
+                            )
+                        }
+                    }
+                }
+            },
+            negativeText = "Keep Backup Active"
+        )
+    }
+
+    // -------------------------------------------------------------------------
     // Settings Dialog
     // -------------------------------------------------------------------------
 
@@ -1260,12 +1723,14 @@ class MainActivity : Activity() {
         val configured = cloudClient.configured()
         val currentHost = getGatewayHost()
         val statusMsg = if (configured) "Configured (Calls this month: $calls / 850 cap)" else "Not configured"
+        val stormTestLabel = if (stormAlertActive) "Hide Storm Alert Pill (Test UI)" else "Show Storm Alert Pill (Test UI)"
 
         val options = arrayOf(
             "Configure Gateway Host (Current: $currentHost)",
             "Enter / Replace Gateway Token",
             "Configure Enphase Cloud API ($statusMsg)",
-            "Refresh Cloud History & Charger Now"
+            "Refresh Cloud History & Charger Now",
+            stormTestLabel
         )
 
         AlertDialog.Builder(this)
@@ -1280,6 +1745,12 @@ class MainActivity : Activity() {
                         requestCloudHistory(force = true)
                         requestEvCharger(force = true)
                         Toast.makeText(this, "Cloud refresh requested", Toast.LENGTH_SHORT).show()
+                    }
+                    4 -> {
+                        val newActive = !stormAlertActive
+                        updateStormBadge(newActive, if (newActive) "Until 6:00 PM" else null, "Severe Thunderstorm Warning issued by NWS.")
+                        val msg = if (newActive) "Storm Alert pill displayed on top bar" else "Storm Alert pill hidden"
+                        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                     }
                 }
             }

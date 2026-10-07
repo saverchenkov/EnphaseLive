@@ -423,10 +423,10 @@ class EnergyFlowView(context: Context) : View(context) {
         val evPwr = evPowerKw
         val evCharging = evPwr != null && evPwr > 0.05
         val evBadgeText = when {
-            evPwr == null -> "🚗 EV: Standby"
-            evCharging -> String.format(Locale.US, "🚗 EV %.1f kW · Charging", evPwr)
-            !evMode.isNullOrEmpty() -> String.format(Locale.US, "🚗 EV 0.0 kW · %s", evMode)
-            else -> "🚗 EV 0.0 kW · Unplugged"
+            evPwr == null -> "EV: Standby"
+            evCharging -> String.format(Locale.US, "EV %.1f kW · Charging", evPwr)
+            !evMode.isNullOrEmpty() -> String.format(Locale.US, "EV 0.0 kW · %s", evMode)
+            else -> "EV 0.0 kW · Unplugged"
         }
         val evBadgeColor = if (evCharging) cyan else Color.rgb(255, 196, 118)
         val evBadgeBg = if (evCharging) Color.rgb(18, 48, 55) else Color.rgb(24, 42, 54)
