@@ -1043,7 +1043,7 @@ class MainActivity : Activity() {
                             Instant.ofEpochSecond(lastUpdate).atZone(zone).format(DateTimeFormatter.ofPattern("h:mm:ss a"))
                         } else "Live"
 
-                        liveStatusText.text = if (ageSec > 30) {
+                        liveStatusText.text = if (ageSec > 120) {
                             "Gateway reading: $timeStr · Stale (${ageSec}s ago) · 1s polling"
                         } else {
                             "Gateway reading: $timeStr · ${ageSec}s ago · 1s local polling"

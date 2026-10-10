@@ -355,8 +355,7 @@ class EnergyFlowView(context: Context) : View(context) {
         c.translate((width - vWidth * scale) / 2f, (height - vHeight * scale) / 2f)
         c.scale(scale, scale)
 
-        val stale = meters?.optLong("last_update", 0)?.let { System.currentTimeMillis() / 1000 - it > 30 } ?: true
-        if (disconnected || stale) c.saveLayerAlpha(0f, 0f, vWidth, vHeight, 125)
+        if (disconnected) c.saveLayerAlpha(0f, 0f, vWidth, vHeight, 125)
 
         val centerX = 360f
         val centerY = 180f
@@ -467,10 +466,10 @@ class EnergyFlowView(context: Context) : View(context) {
             batteryKwh = remKwh
         )
 
-        if (disconnected || stale) c.restore()
+        if (disconnected) c.restore()
         c.restore()
 
-        val hasActiveFlow = !disconnected && !stale && (
+        val hasActiveFlow = !disconnected && (
             (power("pv") ?: 0.0) >= 0.05 ||
             abs(power("grid") ?: 0.0) >= 1.0 ||
             (power("load") ?: 0.0) >= 0.05 ||
