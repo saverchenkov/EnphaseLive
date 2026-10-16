@@ -254,10 +254,25 @@ class CloudClient(private val context: Context) {
         saveCachedHistory(period, date, result)
         return result
     }
-    fun charger(): JSONObject = request("latest_telemetry", emptyMap(), 30 * 60 * 1000L)
+    fun charger(force: Boolean = false): JSONObject = request("latest_telemetry", emptyMap(), 15 * 60 * 1000L, force = force)
     fun callCount(): Int = if (usage.getString("month", "") == YearMonth.now(zone).toString()) usage.getInt("count", 0) else 0
 
     companion object {
+        fun formatEvMode(rawMode: String?): String {
+            val cleaned = rawMode?.trim() ?: ""
+            if (cleaned.isEmpty() || cleaned.equals("null", ignoreCase = true)) {
+                return "Plugged-in"
+            }
+            return when (cleaned.uppercase(java.util.Locale.US)) {
+                "PLUGGED_OUT", "UNPLUGGED", "DISCONNECTED" -> "Not Plugged-in"
+                "IDLE", "CONNECTED", "PLUGGED_IN", "READY", "SUSPENDED_EV", "SUSPENDED_EVSE", "PAUSED" -> "Plugged-in"
+                "CHARGING" -> "Charging"
+                "FAULTED", "ERROR" -> "Faulted"
+                "UNAVAILABLE", "OFFLINE" -> "Offline"
+                else -> cleaned.replace('_', ' ').lowercase(java.util.Locale.US).replaceFirstChar { it.titlecase(java.util.Locale.US) }
+            }
+        }
+
         fun isPriorPeriod(period: String, date: String, today: LocalDate = LocalDate.now()): Boolean {
             return try {
                 if (period == "month") {

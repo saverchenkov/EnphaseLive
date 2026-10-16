@@ -1,5 +1,6 @@
 package com.saver.enphaselive
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -10,6 +11,21 @@ import java.time.ZoneId
 class CloudClientCacheTest {
 
     private val zone = ZoneId.of("UTC")
+
+    @Test
+    fun testFormatEvMode() {
+        assertEquals("Plugged-in", CloudClient.formatEvMode(null))
+        assertEquals("Plugged-in", CloudClient.formatEvMode(""))
+        assertEquals("Plugged-in", CloudClient.formatEvMode("null"))
+        assertEquals("Not Plugged-in", CloudClient.formatEvMode("PLUGGED_OUT"))
+        assertEquals("Not Plugged-in", CloudClient.formatEvMode("UNPLUGGED"))
+        assertEquals("Plugged-in", CloudClient.formatEvMode("IDLE"))
+        assertEquals("Plugged-in", CloudClient.formatEvMode("SUSPENDED_EV"))
+        assertEquals("Plugged-in", CloudClient.formatEvMode("SUSPENDED_EVSE"))
+        assertEquals("Charging", CloudClient.formatEvMode("CHARGING"))
+        assertEquals("Faulted", CloudClient.formatEvMode("FAULTED"))
+        assertEquals("Offline", CloudClient.formatEvMode("UNAVAILABLE"))
+    }
 
     @Test
     fun testIsPriorPeriodDay() {

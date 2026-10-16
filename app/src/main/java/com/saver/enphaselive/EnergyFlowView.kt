@@ -420,16 +420,36 @@ class EnergyFlowView(context: Context) : View(context) {
 
         // 3. Home Node (Right - spaced out to right edge)
         val evPwr = evPowerKw
-        val evCharging = evPwr != null && evPwr > 0.05
+        val evHasPower = evPwr != null && evPwr > 0.05
+        val evCharging = evHasPower || evMode.equals("Charging", ignoreCase = true)
+        val evPluggedIn = !evCharging && evMode.equals("Plugged-in", ignoreCase = true)
         val evBadgeText = when {
-            evPwr == null -> "EV: Standby"
-            evCharging -> String.format(Locale.US, "EV %.1f kW · Charging", evPwr)
+            evPwr == null && evMode.isNullOrEmpty() -> "EV: Standby"
+            evHasPower -> String.format(Locale.US, "EV %.1f kW · Charging", evPwr)
+            evCharging -> "EV · Charging"
             !evMode.isNullOrEmpty() -> String.format(Locale.US, "EV 0.0 kW · %s", evMode)
-            else -> "EV 0.0 kW · Unplugged"
+            else -> "EV 0.0 kW · Not Plugged-in"
         }
-        val evBadgeColor = if (evCharging) cyan else Color.rgb(255, 196, 118)
-        val evBadgeBg = if (evCharging) Color.rgb(18, 48, 55) else Color.rgb(24, 42, 54)
-        val evBadgeStroke = if (evCharging) Color.rgb(35, 80, 95) else Color.rgb(45, 68, 80)
+        val evBadgeColor = when {
+            evCharging -> cyan
+            evPluggedIn -> green
+            else -> Color.rgb(255, 196, 118)
+        }
+        val evBadgeBg = when {
+            evCharging -> Color.rgb(18, 48, 55)
+            evPluggedIn -> Color.rgb(18, 48, 45)
+            else -> Color.rgb(24, 42, 54)
+        }
+        val evBadgeStroke = when {
+            evCharging -> Color.rgb(35, 80, 95)
+            evPluggedIn -> Color.rgb(35, 85, 70)
+            else -> Color.rgb(45, 68, 80)
+        }
+        val homeTitle = if (evHasPower && load != null && load > (evPwr ?: 0.0) + 0.05) {
+            String.format(Locale.US, "Home using · %.1f kW Home", max(0.0, load - (evPwr ?: 0.0)))
+        } else {
+            "Home using"
+        }
 
         node(
             c = c,
@@ -438,7 +458,7 @@ class EnergyFlowView(context: Context) : View(context) {
             w = nodeW,
             h = nodeH,
             value = load,
-            title = "Home using",
+            title = homeTitle,
             color = orange,
             icon = "⌂",
             subBadgeText = evBadgeText,

@@ -71,4 +71,56 @@ class RealtimeDataStoreTest {
         assertEquals(4500f, latest.productionW, 0.1f)
         assertEquals(1200f, latest.consumptionW, 0.1f)
     }
+
+    @Test
+    fun testEstimateEvPowerW_DetectsStepJumpAndSplitsHouseholdLoad() {
+        val dir = tempFolder.newFolder("nobackup_ev")
+        val store = RealtimeDataStore(storageDir = dir)
+        val baseTs = 1792170000L
+
+        // 1. 10 minutes of normal ~1.9 kW household baseline load
+        for (i in 0 until 600) {
+            store.addSample(
+                productionW = 6300f,
+                consumptionW = 1900f,
+                dischargeW = 0f,
+                exportW = 4400f,
+                importW = 0f,
+                timestampSec = baseTs + i
+            )
+        }
+        assertEquals(0f, store.estimateEvPowerW(1900f, baseTs + 599), 0.1f)
+
+        // 2. Brief 2-second spike to 6.0 kW (e.g. motor inrush) should be debounced
+        store.addSample(6300f, 6000f, 0f, 300f, 0f, timestampSec = baseTs + 600)
+        store.addSample(6300f, 6000f, 0f, 300f, 0f, timestampSec = baseTs + 601)
+        assertEquals(0f, store.estimateEvPowerW(6000f, baseTs + 601), 0.1f)
+
+        // 3. Sustained EV charging step jump to 13.3 kW (1.9 kW house + 11.4 kW EV)
+        for (i in 602..630) {
+            store.addSample(
+                productionW = 6300f,
+                consumptionW = 13300f,
+                dischargeW = 7000f,
+                exportW = 0f,
+                importW = 0f,
+                timestampSec = baseTs + i
+            )
+        }
+        val estimatedEvW = store.estimateEvPowerW(13300f, baseTs + 630)
+        assertEquals(11400f, estimatedEvW, 50f)
+
+        // 4. Temporary 1.5 kW microwave turning on during EV charge (total 14.8 kW) keeps EV at 11.4 kW
+        for (i in 631..640) {
+            store.addSample(6300f, 14800f, 8500f, 0f, 0f, timestampSec = baseTs + i)
+        }
+        val estimatedDuringApplianceW = store.estimateEvPowerW(14800f, baseTs + 640)
+        assertEquals(11400f, estimatedDuringApplianceW, 50f)
+
+        // 5. EV stops charging (load drops back to 1.9 kW) -> immediately returns 0 W,
+        //    while lastEvChargingTimestampSec remembers the recent charging session
+        store.addSample(6300f, 1900f, 0f, 4400f, 0f, timestampSec = baseTs + 641)
+        assertEquals(0f, store.estimateEvPowerW(1900f, baseTs + 641), 0.1f)
+        assertEquals(baseTs + 640L, store.lastEvChargingTimestampSec(baseTs + 641))
+    }
 }

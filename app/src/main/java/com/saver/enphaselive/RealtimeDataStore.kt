@@ -229,4 +229,140 @@ class RealtimeDataStore(private val context: Context? = null, storageDir: File? 
     }
 
     fun getLatestSample(): RealtimePowerSample? = lock.read { samples.lastOrNull() }
+
+    /**
+     * Estimates active Level 2 EV charger power draw (in Watts) from local 1-second consumption history.
+     *
+     * Because the IQ EV Charger 2 is a Wi-Fi device whose power draw passes through the local IQ Gateway's
+     * site consumption CTs (`meters.load`), an EV charging session produces a sustained multi-kW step-up
+     * above the pre-charging household baseline load (e.g., 1.9 kW household -> 13.3 kW total = 11.4 kW EV).
+     */
+    fun estimateEvPowerW(currentConsW: Float, nowSec: Long = System.currentTimeMillis() / 1000L): Float {
+        if (currentConsW < 4500f) return 0f
+
+        return lock.read {
+            if (samples.isEmpty()) {
+                return@read if (currentConsW >= 6000f) (currentConsW - 1800f).coerceAtMost(11440f) else 0f
+            }
+
+            // 1. Verify high consumption is sustained (debounce brief 1-5s appliance startup transients)
+            var recentHighCount = 0
+            var recentTotalCount = 0
+            for (i in samples.size - 1 downTo 0) {
+                val s = samples[i]
+                if (nowSec - s.timestampSec > 6L) break
+                recentTotalCount++
+                if (s.consumptionW >= 4500f) recentHighCount++
+            }
+            if (recentTotalCount >= 3 && recentHighCount < recentTotalCount) {
+                return@read 0f
+            }
+
+            // 2. Walk backward to find where the current high-load plateau (>= 4200 W) started
+            var plateauStartIdx = samples.size - 1
+            while (plateauStartIdx > 0) {
+                val prev = samples[plateauStartIdx - 1]
+                if (nowSec - prev.timestampSec > 6 * 3600L) break
+                if (prev.consumptionW < 4200f) break
+                plateauStartIdx--
+            }
+            val plateauStartSec = samples[plateauStartIdx].timestampSec
+
+            // 3. Determine pre-step household baseline load (prefer 3-minute window right before the step-up)
+            val preStepValues = ArrayList<Float>(180)
+            if (plateauStartIdx > 0) {
+                for (i in plateauStartIdx - 1 downTo 0) {
+                    val s = samples[i]
+                    val dt = plateauStartSec - s.timestampSec
+                    if (dt > 185L) break
+                    if (dt >= 3L && s.consumptionW in 100f..4000f) {
+                        preStepValues.add(s.consumptionW)
+                    }
+                }
+            }
+
+            val baselineW: Float = if (preStepValues.size >= 5) {
+                preStepValues.sort()
+                preStepValues[preStepValues.size / 2]
+            } else {
+                // Fallback: median of non-EV quiet household samples (< 4000 W) over the last 6 hours
+                val quietValues = ArrayList<Float>(256)
+                val step = max(1, samples.size / 500)
+                var i = samples.size - 1
+                while (i >= 0) {
+                    val s = samples[i]
+                    if (nowSec - s.timestampSec > 6 * 3600L) break
+                    if (s.consumptionW in 100f..4000f) {
+                        quietValues.add(s.consumptionW)
+                    }
+                    i -= step
+                }
+                if (quietValues.isNotEmpty()) {
+                    quietValues.sort()
+                    quietValues[quietValues.size / 2]
+                } else {
+                    1800f
+                }
+            }
+
+            val rawDeltaW = currentConsW - baselineW
+            if (rawDeltaW < 3500f) return@read 0f
+
+            // 4. Reject temporary household spikes on top of an active EV charge by checking the 25th percentile
+            // of the plateau over the last 3 minutes (once the plateau has been stable for >= 20 seconds).
+            val plateauDurationSec = nowSec - plateauStartSec
+            val effectiveDeltaW = if (plateauDurationSec >= 20L) {
+                val recentPlateau = ArrayList<Float>(180)
+                for (i in samples.size - 1 downTo plateauStartIdx) {
+                    val s = samples[i]
+                    if (nowSec - s.timestampSec > 180L) break
+                    if (s.timestampSec >= plateauStartSec + 5L && s.consumptionW >= 4500f) {
+                        recentPlateau.add(s.consumptionW)
+                    }
+                }
+                if (recentPlateau.size >= 10) {
+                    recentPlateau.sort()
+                    val floorConsW = recentPlateau[recentPlateau.size / 4]
+                    val floorDeltaW = floorConsW - baselineW
+                    if (floorDeltaW >= 3500f) minOf(rawDeltaW, floorDeltaW) else rawDeltaW
+                } else {
+                    rawDeltaW
+                }
+            } else {
+                rawDeltaW
+            }
+
+            if (effectiveDeltaW >= 3500f) effectiveDeltaW.coerceAtMost(11440f) else 0f
+        }
+    }
+
+    /**
+     * Returns the timestamp (in epoch seconds) of the most recent sustained Level 2 EV charging
+     * plateau (>= 6000 W sustained for >= 15 seconds) in the persisted 24-hour history, or 0L if none.
+     */
+    fun lastEvChargingTimestampSec(nowSec: Long = System.currentTimeMillis() / 1000L): Long {
+        return lock.read {
+            if (samples.isEmpty()) return@read 0L
+            var runEndSec = 0L
+            var runStartSec = 0L
+            var runCount = 0
+            for (i in samples.size - 1 downTo 0) {
+                val s = samples[i]
+                if (nowSec - s.timestampSec > MAX_RETENTION_SEC) break
+                if (s.consumptionW >= 6000f) {
+                    if (runCount == 0) {
+                        runEndSec = s.timestampSec
+                    }
+                    runStartSec = s.timestampSec
+                    runCount++
+                    if (runCount >= 10 && runEndSec - runStartSec >= 15L) {
+                        return@read runEndSec
+                    }
+                } else {
+                    runCount = 0
+                }
+            }
+            0L
+        }
+    }
 }

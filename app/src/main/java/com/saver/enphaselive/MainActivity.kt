@@ -77,6 +77,12 @@ class MainActivity : Activity() {
     private var lastCloudHistoryFetchDay: LocalDate? = null
     private var lastChargerFetch = 0L
     private var hasEvCharger: Boolean? = null
+    private var cloudEvPowerKw: Double? = null
+    private var cloudEvMode: String? = null
+    private var cloudEvExplicitUnplugged = false
+    private var localEvChargingActive = false
+    private var lastLocalEvChargingElapsed = 0L
+    private var pendingEvCloudSyncElapsed = 0L
     private var nextBackgroundCheck = 0L
     private var currentProfile = "Self-Consumption"
     private var nextTariffPoll = 0L
@@ -922,6 +928,14 @@ class MainActivity : Activity() {
             return
         }
 
+        // Event-driven EV charger sync triggered ~20s after a multi-kW local load step-up or step-down
+        if (pendingEvCloudSyncElapsed > 0L && nowElapsed >= pendingEvCloudSyncElapsed) {
+            pendingEvCloudSyncElapsed = 0L
+            if (hasEvCharger != false && cloudClient.callCount() < 830 && nowElapsed - lastChargerFetch >= 5 * 60 * 1000L) {
+                requestEvCharger(force = true)
+            }
+        }
+
         val nowToday = LocalDate.now(zone)
         val nowMonth = YearMonth.now(zone)
 
@@ -942,7 +956,7 @@ class MainActivity : Activity() {
         if (isFirstMorningFetch || intervalElapsed) {
             requestCloudHistory(force = true)
             if (hasEvCharger != false) {
-                requestEvCharger(force = false)
+                requestEvCharger(force = true)
             }
         }
     }
@@ -1064,6 +1078,21 @@ class MainActivity : Activity() {
                         val windowSamples = realtimeDataStore.getSamplesForWindow(activeRealtimeDuration)
                         realtimeChartView.updateSamples(windowSamples)
                         updateRealtimeBadges(pvW, loadW, dischW, impW, expW)
+
+                        // Real-time local EV charging detection + cloud sync trigger
+                        val localEstEvW = if (hasEvCharger != false) realtimeDataStore.estimateEvPowerW(loadW, nowSec) else 0f
+                        val localEstEvKw = localEstEvW / 1000.0
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        val isLocalCharging = localEstEvKw >= 1.4
+                        if (isLocalCharging != localEvChargingActive) {
+                            localEvChargingActive = isLocalCharging
+                            // Give EV charger ~20s to report state transition to Enphase Cloud before syncing
+                            pendingEvCloudSyncElapsed = nowElapsed + 20_000L
+                        }
+                        if (isLocalCharging) {
+                            lastLocalEvChargingElapsed = nowElapsed
+                        }
+                        updateResolvedEvState(loadW / 1000.0, localEstEvKw)
                     }
                 }.onFailure { err ->
                     localFailures++
@@ -1280,17 +1309,68 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateResolvedEvState(currentLoadKw: Double, localEstEvKw: Double) {
+        if (hasEvCharger == false) {
+            energyFlowView.setEvCharger(null, "No charger")
+            return
+        }
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val nowSec = System.currentTimeMillis() / 1000L
+        val lastPersistedChargeSec = realtimeDataStore.lastEvChargingTimestampSec(nowSec)
+        val hasRecentPersistedCharge = lastPersistedChargeSec > 0L && (nowSec - lastPersistedChargeSec) <= 18 * 3600L
+        val cloudPwr = cloudEvPowerKw
+        val cloudMode = cloudEvMode
+
+        when {
+            // 1. Active local EV charging step detected on 1s Gateway CTs
+            localEstEvKw >= 1.4 -> {
+                val effectiveKw = if (cloudPwr != null && cloudPwr > 0.5 &&
+                    cloudPwr <= currentLoadKw - 0.2 &&
+                    kotlin.math.abs(cloudPwr - localEstEvKw) <= 1.5
+                ) {
+                    cloudPwr
+                } else {
+                    localEstEvKw
+                }
+                energyFlowView.setEvCharger(effectiveKw, "Charging")
+            }
+            // 2. Cloud reports charging AND current local site load is high enough to support it
+            cloudPwr != null && cloudPwr > 0.5 && currentLoadKw >= cloudPwr + 0.3 -> {
+                energyFlowView.setEvCharger(cloudPwr, "Charging")
+            }
+            // 3. EV was charging locally (in-memory or persisted 24h history) and paused/finished,
+            //    or Cloud still says "Charging" while local load has already dropped back to normal
+            ((lastLocalEvChargingElapsed > 0L && nowElapsed - lastLocalEvChargingElapsed < 18 * 3600 * 1000L) ||
+                hasRecentPersistedCharge) && !cloudEvExplicitUnplugged ||
+                cloudMode.equals("Charging", ignoreCase = true) -> {
+                energyFlowView.setEvCharger(0.0, "Plugged-in")
+            }
+            // 4. Default to Cloud status
+            cloudMode != null -> {
+                energyFlowView.setEvCharger(0.0, cloudMode)
+            }
+            !cloudClient.configured() -> {
+                energyFlowView.setEvCharger(0.0, "Standby")
+            }
+            else -> {
+                energyFlowView.setEvCharger(null, null)
+            }
+        }
+    }
+
     private fun requestEvCharger(force: Boolean = false) {
         if (!cloudClient.configured()) {
-            energyFlowView.setEvCharger(null, "Cloud off")
+            val latestLoadW = lastRtConsW
+            val localEstEvKw = if (latestLoadW > 0f) realtimeDataStore.estimateEvPowerW(latestLoadW) / 1000.0 else 0.0
+            updateResolvedEvState(latestLoadW / 1000.0, localEstEvKw)
             return
         }
         val now = SystemClock.elapsedRealtime()
-        if (!force && now - lastChargerFetch < 30 * 60 * 1000L) return
+        if (!force && now - lastChargerFetch < 15 * 60 * 1000L) return
         lastChargerFetch = now
 
         cloudWorker.execute {
-            val result = runCatching { cloudClient.charger() }
+            val result = runCatching { cloudClient.charger(force = force) }
             runOnUiThread {
                 if (isDestroyed || !resumed) return@runOnUiThread
 
@@ -1300,18 +1380,30 @@ class MainActivity : Activity() {
                     if (evseList != null && evseList.length() > 0) {
                         hasEvCharger = true
                         val ev = evseList.getJSONObject(0)
-                        val rawMode = if (ev.isNull("operational_mode")) "" else ev.optString("operational_mode", "")
-                        val mode = if (rawMode.isEmpty() || rawMode.equals("null", true)) "Not Plugged-in" else rawMode.replace('_', ' ')
+                        val rawMode = if (ev.isNull("operational_mode")) "" else ev.optString("operational_mode", "").trim()
+                        val mode = CloudClient.formatEvMode(rawMode)
                         val powerW = if (ev.isNull("power")) 0.0 else ev.optDouble("power", 0.0)
                         val powerKw = if (powerW > 0) powerW / 1000.0 else 0.0
 
-                        energyFlowView.setEvCharger(powerKw, mode)
+                        cloudEvPowerKw = powerKw
+                        cloudEvMode = mode
+                        cloudEvExplicitUnplugged = rawMode.equals("PLUGGED_OUT", ignoreCase = true) ||
+                            rawMode.equals("UNPLUGGED", ignoreCase = true)
+
+                        val latestLoadW = lastRtConsW
+                        val localEstEvKw = if (latestLoadW > 0f) realtimeDataStore.estimateEvPowerW(latestLoadW) / 1000.0 else 0.0
+                        updateResolvedEvState(latestLoadW / 1000.0, localEstEvKw)
                     } else {
                         hasEvCharger = false
                         energyFlowView.setEvCharger(null, "No charger")
                     }
                 }.onFailure {
-                    energyFlowView.setEvCharger(null, "Offline")
+                    if (cloudEvMode == null) {
+                        cloudEvMode = "Offline"
+                    }
+                    val latestLoadW = lastRtConsW
+                    val localEstEvKw = if (latestLoadW > 0f) realtimeDataStore.estimateEvPowerW(latestLoadW) / 1000.0 else 0.0
+                    updateResolvedEvState(latestLoadW / 1000.0, localEstEvKw)
                 }
             }
         }
